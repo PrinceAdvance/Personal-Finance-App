@@ -398,7 +398,6 @@ if not df.empty:
         trend_data = df.groupby([df['Date'].dt.date, 'Type'])['Amount'].sum().reset_index()
         trend_data = trend_data.sort_values(by="Date")
         
-        import plotly.express as px
         fig_trend = px.line(
             trend_data, 
             x='Date', 
