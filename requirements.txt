@@ -1,5 +1,3 @@
-Streamlit
+streamlit
 plotly
 pandas
-datetime
-io
