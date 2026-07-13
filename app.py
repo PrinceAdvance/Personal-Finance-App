@@ -1,7 +1,12 @@
 import streamlit as st
-import plotly.express as px
 import pandas as pd
 import datetime
+import io
+import plotly.express as px
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+from auth import login, logout_button
 
 st.set_page_config(
     page_title="WealthFlow | Personal Finance Command Center",
@@ -9,6 +14,96 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# --- FIREBASE INITIALIZATION ---
+# st.cache_resource ensures this only runs once per server process,
+# avoiding the "app already exists" error on every Streamlit rerun.
+@st.cache_resource
+def get_db():
+    if not firebase_admin._apps:
+        cred_dict = dict(st.secrets["firebase"])
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+# --- AUTH GATE + FIRESTORE CONNECTION ---
+user_id = login()
+db = get_db()
+
+# --- COMPREHENSIVE CATEGORY DEFINITIONS ---
+CATEGORIES = {
+    "Income": ["Salary", "Investments", "Side Hustle", "Gift", "Offering", "Savings", "Other"],
+    "Expense": [
+        "Travel & Tourism", 
+        "Data", 
+        "Tithe", 
+        "Offering", 
+        "Savings",
+        "Bills & Utilities", 
+        "Entertainment", 
+        "Food & Dining", 
+        "Healthcare", 
+        "Shopping", 
+        "Transportation", 
+        "Other"
+    ]
+}
+
+def _transactions_ref(user_id):
+    return db.collection("users").document(user_id).collection("transactions")
+
+
+def load_transactions(user_id):
+    """Loads this user's transaction history from Firestore into a DataFrame.
+
+    The Firestore document id for each transaction is kept as the DataFrame
+    index (named '_id') so edits/deletes can be written back to the exact
+    same document later.
+    """
+    docs = _transactions_ref(user_id).stream()
+    rows, ids = [], []
+    for d in docs:
+        rows.append(d.to_dict())
+        ids.append(d.id)
+
+    if not rows:
+        df = pd.DataFrame(columns=["Date", "Category", "Type", "Amount", "Notes"])
+        df.index = pd.Index([], name="_id")
+        return df
+
+    df = pd.DataFrame(rows)
+    df.index = pd.Index(ids, name="_id")
+    df['Date'] = pd.to_datetime(df['Date'])
+    return df[["Date", "Category", "Type", "Amount", "Notes"]]
+
+
+def add_transaction_to_db(user_id, date_val, category, type_val, amount, notes):
+    _transactions_ref(user_id).add({
+        "Date": pd.to_datetime(date_val).strftime("%Y-%m-%d"),
+        "Category": category,
+        "Type": type_val,
+        "Amount": float(amount),
+        "Notes": notes if notes else "-",
+    })
+
+
+def update_transaction_in_db(user_id, doc_id, row):
+    _transactions_ref(user_id).document(doc_id).set({
+        "Date": pd.to_datetime(row['Date']).strftime("%Y-%m-%d"),
+        "Category": row['Category'],
+        "Type": row['Type'],
+        "Amount": float(row['Amount']),
+        "Notes": row['Notes'] if row['Notes'] else "-",
+    })
+
+
+def delete_transaction_from_db(user_id, doc_id):
+    _transactions_ref(user_id).document(doc_id).delete()
+
+
+def delete_all_transactions(user_id):
+    for d in _transactions_ref(user_id).stream():
+        d.reference.delete()
 
 # --- CUSTOM CSS FOR MODERN PREMIUM UI ---
 st.markdown("""
@@ -52,37 +147,9 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- COMPREHENSIVE CATEGORY DEFINITIONS ---
-CATEGORIES = {
-    "Income": ["Salary", "Investments", "Side Hustle", "Gift", "Offering", "Savings", "Other"],
-    "Expense": [
-        "Travel & Tourism", 
-        "Data", 
-        "Tithe", 
-        "Offering", 
-        "Savings",
-        "Bills & Utilities", 
-        "Entertainment", 
-        "Food & Dining", 
-        "Healthcare", 
-        "Shopping", 
-        "Transportation", 
-        "Other"
-    ]
-}
-
 # --- INITIAL SESSION STATE SETUP ---
 if 'transactions' not in st.session_state:
-    st.session_state.transactions = pd.DataFrame([
-        {"Date": "2026-06-01", "Category": "Salary", "Type": "Income", "Amount": 5200.00, "Notes": "Monthly Corporate Pay"},
-        {"Date": "2026-06-03", "Category": "Bills & Utilities", "Type": "Expense", "Amount": 150.00, "Notes": "Electricity and internet"},
-        {"Date": "2026-06-05", "Category": "Food & Dining", "Type": "Expense", "Amount": 220.00, "Notes": "Monthly grocery delivery"},
-        {"Date": "2026-06-08", "Category": "Tithe", "Type": "Expense", "Amount": 520.00, "Notes": "Tithe offering contribution"},
-        {"Date": "2026-06-10", "Category": "Investments", "Type": "Income", "Amount": 300.00, "Notes": "Quarterly stock dividend payouts"},
-        {"Date": "2026-06-12", "Category": "Data", "Type": "Expense", "Amount": 45.00, "Notes": "Mobile data bundle renewal"},
-        {"Date": "2026-06-15", "Category": "Travel & Tourism", "Type": "Expense", "Amount": 450.00, "Notes": "Weekend retreat booking"}
-    ])
-    st.session_state.transactions['Date'] = pd.to_datetime(st.session_state.transactions['Date'])
+    st.session_state.transactions = load_transactions(user_id)
 
 if 'currency_symbol' not in st.session_state:
     st.session_state.currency_symbol = "$"
@@ -101,21 +168,17 @@ def process_imported_df(imported_df):
     Intelligently extracts, cleans, maps, and standardizes columns 
     from uploaded or linked spreadsheets.
     """
-    # 1. Resolve date column (fuzzy match)
     date_col = next((c for c in imported_df.columns if 'date' in c.lower()), None)
     
-    # 2. Resolve Category (avoid summary pivot categories like Category.1 on the right side)
     cat_cols = [c for c in imported_df.columns if 'category' in c.lower()]
     cat_col = None
     for c in cat_cols:
-        # Avoid matching auxiliary columns or second index tables
         if not any(s in c.lower() for s in ['.1', '.2', 'sum', 'total', 'grand']):
             cat_col = c
             break
     if not cat_col and cat_cols:
         cat_col = cat_cols
         
-    # 3. Resolve Amount column
     amount_cols = [c for c in imported_df.columns if 'amount' in c.lower()]
     amount_col = None
     for c in amount_cols:
@@ -125,56 +188,41 @@ def process_imported_df(imported_df):
     if not amount_col and amount_cols:
         amount_col = amount_cols
         
-    # 4. Resolve Notes / Description column
     notes_col = next((c for c in imported_df.columns if any(x in c.lower() for x in ['notes', 'description', 'desc', 'memo', 'particulars', 'narrative'])), None)
-    
-    # 5. Resolve Type
     type_col = next((c for c in imported_df.columns if 'type' in c.lower()), None)
 
-    # Validate that we have at least a Date, Category, and Amount to map
     if date_col and cat_col and amount_col:
         mapped_df = pd.DataFrame()
-        
-        # Standardize Date column
         mapped_df['Date'] = pd.to_datetime(imported_df[date_col], errors='coerce')
-        
-        # Standardize Category column
         mapped_df['Category'] = imported_df[cat_col].fillna("Other")
         
-        # Standardize Amount column (cleaning potential non-numeric strings like "$", "₵", commas)
         if imported_df[amount_col].dtype == object:
             clean_amounts = imported_df[amount_col].astype(str).str.replace(r'[^\d.]', '', regex=True)
             mapped_df['Amount'] = pd.to_numeric(clean_amounts, errors='coerce').fillna(0.0)
         else:
             mapped_df['Amount'] = pd.to_numeric(imported_df[amount_col], errors='coerce').fillna(0.0)
             
-        # Standardize Notes
         if notes_col:
             mapped_df['Notes'] = imported_df[notes_col].fillna("-")
         else:
             mapped_df['Notes'] = "-"
             
-        # Standardize Type
         if type_col:
             mapped_df['Type'] = imported_df[type_col].fillna("Expense")
         else:
-            # Check if Category exists in our pre-defined Income types
             income_cats_lower = [cat.lower().strip() for cat in CATEGORIES["Income"]]
             mapped_df['Type'] = mapped_df['Category'].apply(
                 lambda x: "Income" if str(x).lower().strip() in income_cats_lower else "Expense"
             )
 
-        # Map fuzzy/custom categories to standard categories
         def standardize_category(row):
             cat_str = str(row['Category']).strip()
             tx_type = row['Type']
             
-            # Exact match check
             for standard_cat in CATEGORIES[tx_type]:
                 if cat_str.lower() == standard_cat.lower():
                     return standard_cat
             
-            # Common aliases
             aliases = {
                 "travel": "Travel & Tourism",
                 "traveling": "Travel & Tourism",
@@ -196,19 +244,13 @@ def process_imported_df(imported_df):
             return "Other"
 
         mapped_df['Category'] = mapped_df.apply(standardize_category, axis=1)
-        
-        # Clean up empty rows (e.g., Grand totals at bottom, pivot rows)
         mapped_df = mapped_df.dropna(subset=['Date', 'Amount'])
         mapped_df = mapped_df[mapped_df['Date'].notna()]
         
-        # Keep clean active schema columns
         required_columns = ["Date", "Category", "Type", "Amount", "Notes"]
         final_df = mapped_df[required_columns].copy()
-        
-        # Force convert parsed Date column to datetime format
         final_df['Date'] = pd.to_datetime(final_df['Date'])
         
-        # Try to detect dynamic currency from amount column name
         detected_currency = None
         if "ghs" in amount_col.lower() or "₵" in amount_col.lower():
             detected_currency = "₵"
@@ -225,41 +267,30 @@ def process_imported_df(imported_df):
 
 # --- TRANSACTION SUBMISSION CALLBACK ---
 def handle_add_tx_callback():
-    """
-    Safely executes transaction processing and resets widget states
-    during pre-render callbacks. This prevents StreamlitAPIException.
-    """
-    # Extract values directly from state keys
+    """Adds a transaction to Firestore and refreshes the in-memory table."""
     date_val = st.session_state.tx_date
     type_val = st.session_state.tx_type
     cat_val = st.session_state.tx_category
     amount_val = st.session_state.tx_amount
     notes_val = st.session_state.tx_notes
-    
-    # Construct and add row
-    new_tx = pd.DataFrame([{
-        "Date": pd.to_datetime(date_val),
-        "Category": cat_val,
-        "Type": type_val,
-        "Amount": float(amount_val),
-        "Notes": notes_val if notes_val else "-"
-    }])
-    
-    st.session_state.transactions = pd.concat([st.session_state.transactions, new_tx], ignore_index=True)
-    st.session_state.transactions['Date'] = pd.to_datetime(st.session_state.transactions['Date'])
-    
-    # Safe resetting of widget states (works beautifully inside callbacks)
+
+    add_transaction_to_db(user_id, date_val, cat_val, type_val, amount_val, notes_val)
+    st.session_state.transactions = load_transactions(user_id)
+
+    # Clear visual sidebar input states
     st.session_state.tx_amount = 0.01
     st.session_state.tx_notes = ""
     st.session_state.tx_success_trigger = True
 
 # --- SIDEBAR INTERFACE ---
 with st.sidebar:
+    st.caption(f"Logged in as **{user_id}**")
+    logout_button()
+    st.markdown("---")
     st.markdown("## ⚙️ System Settings")
     
     currency_options = ["$", "€", "£", "¥", "₵", "₦", "₹", "₱", "zł"]
     
-    # We load dynamic currency if changed during import, otherwise use default
     default_currency_idx = currency_options.index(st.session_state.currency_symbol) if st.session_state.currency_symbol in currency_options else 0
     selected_currency = st.selectbox("💱 Dashboard Currency", currency_options, index=default_currency_idx)
     st.session_state.currency_symbol = selected_currency
@@ -267,7 +298,6 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("## ✨ Add Transaction")
     
-    # We use standard, non-form elements with keys to leverage the callback engine
     col_date, col_type = st.columns(2)
     with col_date:
         tx_date = st.date_input("Date", datetime.date.today(), key="tx_date")
@@ -280,18 +310,15 @@ with st.sidebar:
     tx_amount = st.number_input(f"Amount ({selected_currency})", min_value=0.01, step=10.00, format="%.2f", key="tx_amount")
     tx_notes = st.text_input("Notes / Description", placeholder="e.g. Spotify, Weekly grocery list", key="tx_notes")
     
-    # Direct callback binder ensures values update cleanly and avoids rendering locks
     submit_tx = st.button(label="Add to Ledger", use_container_width=True, type="primary", on_click=handle_add_tx_callback)
 
-    # Toast banner is drawn here on render if trigger was fired in the callback
     if st.session_state.tx_success_trigger:
-        st.toast("Transaction logged successfully!", icon="✅")
+        st.toast("Transaction logged and saved successfully!", icon="✅")
         st.session_state.tx_success_trigger = False
 
     st.markdown("---")
     st.markdown("## 📂 CSV Spreadsheet Import")
     
-    # Local File Upload Backup
     uploaded_file = st.file_uploader(
         "📤 Upload local CSV file", 
         type=["csv"], 
@@ -303,12 +330,13 @@ with st.sidebar:
             final_df, detected_curr = process_imported_df(imported_df)
             
             if final_df is not None:
-                st.session_state.transactions = final_df
-                # Ensure date datatype is explicitly standard datetime64
-                st.session_state.transactions['Date'] = pd.to_datetime(st.session_state.transactions['Date'])
+                for _, row in final_df.iterrows():
+                    add_transaction_to_db(user_id, row['Date'], row['Category'], row['Type'], row['Amount'], row['Notes'])
+                st.session_state.transactions = load_transactions(user_id)
+
                 if detected_curr:
                     st.session_state.currency_symbol = detected_curr
-                st.toast("Local ledger file imported successfully!", icon="📂")
+                st.toast("Ledger spreadsheet imported and saved!", icon="📂")
                 st.rerun()
             else:
                 st.error("Failed to parse file. Ensure headers contain 'Date', 'Category' and 'Amount'.")
@@ -317,7 +345,6 @@ with st.sidebar:
 
     st.markdown("---")
     
-    # Export Current Data to CSV with date formatting safety check
     if not st.session_state.transactions.empty:
         export_df = st.session_state.transactions.copy()
         export_df['Date'] = pd.to_datetime(export_df['Date'])
@@ -333,8 +360,9 @@ with st.sidebar:
         )
         
     if st.button("🗑️ Reset Application Ledger", type="secondary", use_container_width=True):
-        st.session_state.transactions = pd.DataFrame(columns=["Date", "Category", "Type", "Amount", "Notes"])
-        st.toast("Ledger successfully reset to empty.", icon="🗑️")
+        delete_all_transactions(user_id)
+        st.session_state.transactions = load_transactions(user_id)
+        st.toast("Ledger database cleared.", icon="🗑️")
         st.rerun()
 
 # --- MAIN DASHBOARD INTERFACE ---
@@ -392,8 +420,6 @@ if not df.empty:
     
     with chart_col1:
         st.markdown("### 📈 Cash Flow Timeline")
-        
-        # Group data chronologically by date
         trend_data = df.groupby([df['Date'].dt.date, 'Type'])['Amount'].sum().reset_index()
         trend_data = trend_data.sort_values(by="Date")
         
@@ -416,7 +442,6 @@ if not df.empty:
         )
         fig_trend.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#E2E8F0')
         fig_trend.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#E2E8F0')
-        
         st.plotly_chart(fig_trend, use_container_width=True)
 
     with chart_col2:
@@ -452,25 +477,60 @@ else:
 
 st.markdown("---")
 
-st.markdown("### 📜 Ledger History")
+st.markdown("### 📜 Interactive Ledger History")
 
 if not df.empty:
-    sorted_df = df.sort_values(by="Date", ascending=False).copy()
-    # Explicitly cast to datetime before running .dt formatting
-    sorted_df['Date'] = pd.to_datetime(sorted_df['Date'])
-    sorted_df['Date'] = sorted_df['Date'].dt.strftime('%Y-%m-%d')
+    st.markdown("*💡 Tip: Double-click any cell to directly edit the values. Your updates save to the database in real-time!*")
     
-    st.dataframe(
+    sorted_df = df.sort_values(by="Date", ascending=False).copy()
+    sorted_df['Date'] = pd.to_datetime(sorted_df['Date'])
+    
+    # Render with st.data_editor to allow live cell-by-cell spreadsheet modifications
+    edited_df = st.data_editor(
         sorted_df,
         column_config={
             "Amount": st.column_config.NumberColumn(f"Amount ({selected_currency})", format=f"{selected_currency}%.2f"),
             "Type": st.column_config.SelectboxColumn("Type", options=["Income", "Expense"]),
-            "Category": st.column_config.TextColumn("Category"),
+            "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES["Income"] + CATEGORIES["Expense"]),
             "Notes": st.column_config.TextColumn("Description"),
-            "Date": st.column_config.TextColumn("Date")
+            "Date": st.column_config.DateColumn("Date")
         },
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        key="ledger_data_editor"
     )
+    
+    # Auto-save changed rows back to their specific Firestore documents
+    if not edited_df.equals(sorted_df):
+        for doc_id in edited_df.index:
+            if not edited_df.loc[doc_id].equals(sorted_df.loc[doc_id]):
+                update_transaction_in_db(user_id, doc_id, edited_df.loc[doc_id])
+        st.session_state.transactions = load_transactions(user_id)
+        st.toast("Spreadsheet edits auto-saved!", icon="💾")
+        st.rerun()
+
+    # --- SIMPLIFIED TRANSACTION DELETION TOOL ---
+    st.markdown("---")
+    st.markdown("### 🗑️ Delete a Transaction")
+    
+    # Bind dropdown directly to dataframe indexes, using formatted labels cleanly without splitting/replace bugs
+    transaction_to_delete = st.selectbox(
+        "Select a transaction to permanently delete:",
+        options=df.index,
+        format_func=lambda idx: f"{df.loc[idx, 'Date'].strftime('%Y-%m-%d')} | {df.loc[idx, 'Category']} | {selected_currency}{df.loc[idx, 'Amount']:,.2f} | {df.loc[idx, 'Notes']}"
+    )
+    
+    col_del1, col_del2 = st.columns(2)
+    with col_del1:
+        delete_btn = st.button("❌ Delete Transaction", type="secondary", use_container_width=True)
+        
+    if delete_btn:
+        # transaction_to_delete is the Firestore document id (the DataFrame index)
+        delete_transaction_from_db(user_id, transaction_to_delete)
+        st.session_state.transactions = load_transactions(user_id)
+
+        st.toast("Transaction successfully deleted!", icon="🗑️")
+        st.rerun()
+
 else:
     st.warning("No recorded transaction history found.")
